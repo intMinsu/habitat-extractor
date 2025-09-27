@@ -639,34 +639,102 @@ def plan_coverage_playlist(
     anchor_idxs: np.ndarray,
     best_yaws: np.ndarray,
     cov_offsets_deg,
+    *,
+    # New knobs to avoid “spin-in-place” sequences
+    order: str = "offset-major",        # {"offset-major","anchor-major(legacy)"}
+    vi_stride: int = 1,                 # how far to shift anchors between offsets
+    avoid_pure_rotation: bool = True,   # interleave anchors so rotations are not consecutive
+    path: np.ndarray = None,            # (Nv,3) visit/path points; enables baseline enforcement
+    min_trans_baseline_m: float = 0.0,  # e.g. 0.25 to ensure >=25 cm between consecutive plans
 ) -> list:
     """
-    Deterministic coverage shots per anchor.
+    Deterministic coverage shots near anchors without back-to-back pure rotations.
 
-    For each anchor index `vi` and its `best_yaw`, emit one plan item per
-    offset in `cov_offsets_deg`:  yaw = wrap(best_yaw + offset_deg).
+    Strategy
+    --------
+    • offset-major order (default): iterate offsets first, then anchors. This naturally
+      alternates positions between consecutive items (translation!), vs. the legacy
+      anchor-major which emits multiple yaws at the SAME anchor back-to-back.
+    • If `avoid_pure_rotation=True`, we roll the anchor list by `vi_stride` for each
+      successive offset so each offset is taken at a neighboring anchor.
+    • Optional baseline guard: if `path` is given, enforce at least
+      `min_trans_baseline_m` between consecutive planned positions.
 
-    Args:
-        anchor_idxs: (Na,) indices into the path.
-        best_yaws: (Na,) refined yaw per anchor [rad].
-        cov_offsets_deg: iterable of offsets (deg), e.g. [0, 90, -90].
+    Args
+    ----
+    anchor_idxs     : (Na,) indices into the path (e.g., anchor waypoints)
+    best_yaws       : (Na,) refined yaw per anchor [rad]
+    cov_offsets_deg : iterable of offsets (deg), e.g. [0, 20, -20]
+    order           : "offset-major" (recommended) or "anchor-major" (legacy behavior)
+    vi_stride       : how many anchors to advance for each successive offset (>=1)
+    avoid_pure_rotation : interleave offsets across anchors to avoid spin-in-place
+    path            : optional (Nv,3) world positions for baseline checks
+    min_trans_baseline_m : minimum Euclidean distance between consecutive plan positions
 
-    Returns:
-        list of dicts: [{"vi": int, "yaw": float_rad}, ...].
-
-    Example:
-        import numpy as np
-        aidx = np.array([10, 50], int)
-        best = np.array([0.2, -0.4], np.float32)
-        playlist = plan_coverage_playlist(aidx, best, cov_offsets_deg=[0, 90, -90])
-        # playlist length == 2 anchors × 3 offsets = 6
-        # first item looks like: {"vi": 10, "yaw": 0.2 (rad)}
+    Returns
+    -------
+    list of dicts: [{"vi": int, "yaw": float_rad}, ...]
     """
+    import math
+    import numpy as np
     from .habitat_sample import wrap_pi
 
+    anchor_idxs = np.asarray(anchor_idxs, dtype=int)
+    best_yaws   = np.asarray(best_yaws, dtype=np.float32)
+    offsets_deg = list(cov_offsets_deg or [0.0])
+
+    if anchor_idxs.size == 0:
+        return []
+
     playlist = []
-    for k, idx in enumerate(anchor_idxs):
-        base = float(best_yaws[k])
-        for off in (cov_offsets_deg or [0.0]):
-            playlist.append({"vi": int(idx), "yaw": wrap_pi(base + math.radians(float(off)))})
+
+    if order == "anchor-major":
+        # Legacy: multiple yaws at the same anchor consecutively (rotation heavy)
+        for k, idx in enumerate(anchor_idxs):
+            base = float(best_yaws[k])
+            for off in offsets_deg:
+                playlist.append({"vi": int(idx), "yaw": wrap_pi(base + math.radians(float(off)))})
+    else:
+        # Recommended: offsets first, then anchors (translation between consecutive items)
+        Na = anchor_idxs.size
+        for j, off in enumerate(offsets_deg):
+            # shift anchors by j*vi_stride so each offset is taken at a different anchor
+            if avoid_pure_rotation and Na > 1:
+                shift = int(j * max(1, vi_stride)) % Na
+                a_idx = np.roll(anchor_idxs, -shift)
+                a_yaw = np.roll(best_yaws,  -shift)
+            else:
+                a_idx = anchor_idxs
+                a_yaw = best_yaws
+            yaw_add = math.radians(float(off))
+            for idx, base in zip(a_idx, a_yaw):
+                playlist.append({"vi": int(idx), "yaw": wrap_pi(float(base) + yaw_add)})
+
+    # Optional: enforce a minimum translational baseline between consecutive plans
+    if path is not None and float(min_trans_baseline_m) > 0.0 and len(playlist) > 1:
+        P = np.asarray(path, dtype=np.float32)
+        Na = anchor_idxs.size
+        # map vi->position in anchor sequence for quick neighbor lookup
+        pos_in_anchor_ring = {int(a): i for i, a in enumerate(anchor_idxs.tolist())}
+        fixed = [playlist[0]]
+        for item in playlist[1:]:
+            vi = item["vi"]
+            ok = True
+            if 0 <= vi < P.shape[0]:
+                d = np.linalg.norm(P[vi] - P[fixed[-1]["vi"]])
+                ok = (d >= float(min_trans_baseline_m))
+            if not ok and Na > 1:
+                # walk forward in the anchor ring until baseline is met (or give up)
+                start = pos_in_anchor_ring.get(vi, 0)
+                for step in range(1, Na):
+                    vi2 = int(anchor_idxs[(start + step) % Na])
+                    if 0 <= vi2 < P.shape[0]:
+                        d2 = np.linalg.norm(P[vi2] - P[fixed[-1]["vi"]])
+                        if d2 >= float(min_trans_baseline_m):
+                            vi = vi2
+                            break
+                item = {"vi": vi, "yaw": item["yaw"]}
+            fixed.append(item)
+        playlist = fixed
+
     return playlist

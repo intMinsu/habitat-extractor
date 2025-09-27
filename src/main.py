@@ -4,6 +4,7 @@ import numpy as np
 import imageio.v3 as iio
 import cv2
 from collections import defaultdict
+from dataclasses import replace
 
 import habitat_sim
 from habitat_sim.sensor import SensorType, SensorSubType, CameraSensorSpec
@@ -15,7 +16,7 @@ from src.utils.config import RenderCfg, parse_configs_from_cli
 from src.utils.geometry import (
     unproject_depth_to_points_cam,
     normals_from_depth,
-    intrinsics_from_sensor
+    intrinsics_from_sensor,
 )
 from src.utils.quaternion_helper import T_c2w_from_sensor_state, rotate_vec3_from_quat_axis
 from src.utils.vis import (
@@ -40,6 +41,13 @@ from src.utils.habitat_traj import (
     compute_anchor_headings,
     build_yaw_schedule_from_anchors,
     plan_coverage_playlist,
+)
+from src.utils.auto_anchor import (
+    auto_tune_anchor_params,
+    retarget_anchor_density,
+    seed_gap_anchors,
+    seed_gap_anchors_relaxed,
+    seed_farthest_on_navmesh
 )
 from src.utils.habitat_traj_vis import (
     save_birdeye_poses_png,
@@ -264,7 +272,7 @@ def _warn_underprovisioned(
     # 1) Not enough views to even touch each anchor once (rough rule of thumb)
     if cov.anchor_yaw_enable and n_anchor_idxs > 0 and cov.n_views < n_anchor_idxs:
         msgs.append(
-            f"n_views={cov.n_views} < num_anchors={n_anchor_idxs}. "
+            f"n_views={cov.n_views} < num_anchors_idxs={n_anchor_idxs}. "
             "Some anchors may never be visited; anchor-based refinement/coverage could be ineffective."
         )
 
@@ -308,11 +316,10 @@ def make_sim(
     sim_cfg.enable_physics = True
     sim_cfg.override_scene_light_defaults = True
 
-    if render.dataset_type == "replica":
-        sim_cfg.scene_light_setup = habitat_sim.gfx.NO_LIGHT_KEY
-    elif render.dataset_type == "hm3d_v2":
+    if render.dataset_type in ["replica", "replicaCAD_baked", "hm3d_v2"]:
         sim_cfg.scene_light_setup = habitat_sim.gfx.NO_LIGHT_KEY
     else:
+        # TODO: You might change this line based on dataset_type, but for replica, replicaCAD, hm3d NO_LIGHT_KEY might suffice.
         sim_cfg.scene_light_setup = habitat_sim.gfx.NO_LIGHT_KEY
 
     # All sensors must have the same resolution and FOV!
@@ -401,22 +408,9 @@ def main():
     • build_yaw_schedule_from_anchors() : interpolate/clamp anchor yaw deltas → full schedule
     • plan_coverage_playlist(...)       : deterministic per-anchor shots (best ± offsets)
 
-    Quick start (Replica)
-    ---------------------
-    python scripts/habitat/extractor.py \\
-      --profile sfm_hq \\
-      --n_anchors=18 \\
-      --n_views=200 \\
-      --dataset-type replica \\
-      --dataset-path habitat-data/replica \\
-      --scene-id room_0 \\
-      --out-path export-replica/room_0
 
     Notes
-    -----
     • Profiles provide sane defaults; any CLI flag can override profile values.
-    • Deterministic coverage is off by default (broad, diverse sampling). Enable it
-      when you want repeatable viewpoints or view-sphere coverage.
     """
     render, cov, qual = parse_configs_from_cli()
     rng = np.random.default_rng(render.seed)
@@ -474,26 +468,92 @@ def main():
 
     #### base trajectory by selecting informative anchors START ####
     """
-    1. Only make_video_like_trajectory + tangent yaws: fastest, good for quick fly-throughs or very open scenes.
+    1. Auto-tune anchor sampling to the scene:
+        • auto_tune_anchor_params: size the anchor spacing/clearance from navmesh span + obstacle stats
+        • retarget_anchor_density : (optional) try a few gentle relaxations to keep ~target #anchors
+    2. Build the path:
+        • make_video_like_trajectory: geodesic tour → densify → smooth → resample
+        
     --- optional refinement (anchor_yaw_enable, anchor_yaw_strength>0) ---
-    2. Add compute_anchor_headings: indoor scenes with frequent occluders; yields more informative, stable looks.
-    3. Add build_yaw_schedule_from_anchors: always recommended once you refine anchors; it spreads local decisions smoothly.
-    4. Add plan_coverage_playlist: benchmarks, ablations, or debugging where you need repeatable specific views.
-    5. That’s the whole story: positions → anchor-wise smart headings → smooth global schedule → (optionally) deterministic shots.
+    3. Add compute_anchor_headings: indoor scenes with frequent occluders; yields more informative, stable looks.
+    4. Add build_yaw_schedule_from_anchors: always recommended once you refine anchors; it spreads local decisions smoothly.
+    5. Add plan_coverage_playlist: benchmarks, ablations, or debugging where you need repeatable specific views.
+    
+    --- Summary ---
+    positions → anchor-wise smart headings → smooth global schedule → (optionally) deterministic shots.
     """
     if cov.traj_mode == "video":
-        base_traj, anchors, _polys = make_video_like_trajectory(
+
+        cov2, notes1 = auto_tune_anchor_params(sim, cov)
+        # ask to keep ~80–100% of requested anchors, not fewer
+        cov2, notes2 = retarget_anchor_density(
             sim,
-            n_anchors=int(cov.n_anchors),
-            stride_m=float(cov.traj_stride_m),
+            cov2,
+            want=max(1, int(0.8 * cov.n_anchors)),
+            min_sep_floor=0.8,
+            relax_iters=10
+        )
+
+        bar = "=" * 78
+        print("\n" + bar)
+        print("[anchor auto-tuning] summary")
+        for s in notes1:
+            print("  •", s)
+        for s in notes2:
+            print("  •", s)
+        print(bar + "\n")
+
+        base_traj, anchors, _ = make_video_like_trajectory(
+            sim,
+            n_anchors=int(cov2.n_anchors),
+            stride_m=float(cov2.traj_stride_m),
             seed=int(render.seed),
-            min_sep_geo=float(cov.min_anchor_sep_m),
+            min_sep_geo=float(cov2.min_anchor_sep_m),
             closed_loop=True,
             densify_max_seg_m=0.20,
             smooth_passes=1,
             return_debug=True,
-            anchor_min_clearance_m=float(cov.anchor_min_clearance_m),
+            anchor_min_clearance_m=float(cov2.anchor_min_clearance_m),
         )
+
+        print(f"anchors before seed_farthest_on_navmesh : {anchors}")
+        need = max(0, int(0.9 * cov.n_anchors) - len(anchors))
+        if need > 0:
+            extra2, notes_far = seed_farthest_on_navmesh(
+                sim,
+                anchors=np.asarray(anchors, np.float32),
+                max_new=need,
+                min_radius_m=max(0.5, 0.7 * cov2.min_anchor_sep_m),  # start reasonably tight
+                min_clearance_m=cov2.anchor_min_clearance_m,
+                samples=12000,
+                batch=3000,
+                rng_seed=render.seed,
+                restrict_to_anchor_island=True,  # <<< important
+            )
+            for s in notes_far: print("  •", s)
+            if len(extra2) > 0:
+                anchors.extend(extra2)
+        print(f"anchors after seed_farthest_on_navmesh : {anchors}")
+
+        def navmesh_connectivity_score(sim, n=300, pairs=900):
+            pf = sim.pathfinder
+            P = []
+            for _ in range(n):
+                p = np.asarray(pf.get_random_navigable_point(), np.float32)
+                if np.isfinite(p).all(): P.append(p)
+            if len(P) < 2: return 0.0
+            P = np.stack(P, 0)
+            rng = np.random.default_rng(0)
+            idx = rng.integers(0, len(P), size=(pairs, 2))
+            ok = 0
+            for i, j in idx:
+                sp = habitat_sim.ShortestPath()
+                sp.requested_start = P[i];
+                sp.requested_end = P[j]
+                if pf.find_path(sp) and np.isfinite(sp.geodesic_distance) and sp.geodesic_distance > 0:
+                    ok += 1
+            return ok / max(1, pairs)
+        print(f"navmesh sanity check : {navmesh_connectivity_score(sim)}")
         base_yaws = compute_path_yaws(base_traj)
 
         # Prevent huge yaw change per step
@@ -544,10 +604,21 @@ def main():
 
             # Optional deterministic coverage (e.g. cov_offsets_deg=[0] to save 'best_yaws' whenever)
             if cov.deterministic_coverage:
+                # coverage_playlist = plan_coverage_playlist(
+                #     anchor_idxs=anchor_idxs,
+                #     best_yaws=best_yaws,
+                #     cov_offsets_deg=cov.cov_offsets_deg,
+                # )
+
                 coverage_playlist = plan_coverage_playlist(
                     anchor_idxs=anchor_idxs,
                     best_yaws=best_yaws,
-                    cov_offsets_deg=cov.cov_offsets_deg,
+                    cov_offsets_deg=cov.cov_offsets_deg,  # e.g., [0, 20, -20]
+                    order="offset-major",  # <-- prevents back-to-back rotations
+                    vi_stride=1,  # hop one anchor per successive offset
+                    avoid_pure_rotation=True,
+                    path=base_traj,  # enable baseline checks
+                    min_trans_baseline_m=0.25,  # ensure >= 25 cm between plans
                 )
 
             cov_ptr = 0
@@ -582,46 +653,73 @@ def main():
 
     # -------- round planning --------
     """
-    We may do multiple passes (“rounds”) over the same visit path, optionally
-    at a different camera height and with a per-round yaw bias.
-
-    round_heights:
-      List of camera heights (meters), typically one or two rounds.
-      Example: H1 = 1.50m, H2 = 1.20m to mix adult/child or tripod heights.
-
-    round_yaw_offsets:
-      List of per-round yaw biases (DEGREES). Each value is added to every
-      frame’s yaw in that round (then wrapped to [-pi, pi)).
-      Examples:
-        [0, 180]  → second pass looks backward (complements coverage).
-        [0, 30]   → slight azimuth sweep for richer parallax.
-        [0, -20, 20] → three passes with small spreads.
-      If fewer offsets than rounds are given, pad with the last value.
-
-    target_per_round:
-      Soft cap on accepted frames per round so total ≈ n_views across rounds.
-      
-    Example:
-    1. Two heights, same look direction
-    two_rounds=True, height2_cm=120, round_yaw_offset_deg=[0]
+    We may do multiple passes (“rounds”) over the same visit path, possibly at a
+    different camera height, with per-round yaw and pitch biases. The scheduler
+    consumes deterministic coverage first, then falls back to normal sampling.
     
-    2. Two passes, second is back-facing
-    two_rounds=True, round_yaw_offset_deg=[0, 180]
+    Order of operation (when deterministic coverage is enabled):
+      1) Run coverage shots for all configured coverage rounds (e.g. rounds 0,1)
+      2) Then run normal (random/smoothed) shots for all rounds until n_views hit
     
-    3. Single pass, slight global twist
-    two_rounds=False, round_yaw_offset_deg=[15]
+    Fields
+    ------
+    round_heights : list[float, m]
+        Camera heights per round. Example: H1 = 1.50, H2 = 1.20.
+        Built from render.height_start_cm and cov.height2_cm when two_rounds=True.
+    
+    round_yaw_offsets : list[float, deg]
+        Static yaw bias added to every frame of that round before wrapping to [-π, π).
+        Examples: [0, 180] (second pass looks backward), [0, 30] (slight sweep).
+    
+    target_per_round : int
+        Soft cap on accepted frames per round so total ≈ cov.n_views across rounds.
+    
+    round_pitch_deg : list[float, deg]
+        Per-round pitch overrides. If provided (e.g. [-5.0, -10.0]), the first value
+        is used for round 0, the second for round 1, etc. If there are fewer entries
+        than rounds, the last value is reused; if missing, we fall back to
+        render.pitch_start. During "normal" sampling we still add small pitch jitter
+        around the per-round base; during "coverage" we keep pitch fixed for
+        determinism.
+    
+    Examples
+    --------
+    1) Single pass, slight global twist
+       two_rounds=False
+       round_yaw_offset_deg=[15]
+       round_pitch_deg=[-5]
+    
+    2) Two passes, complementary directions, different heights & pitches
+       two_rounds=True
+       height2_cm=120
+       round_yaw_offset_deg=[0, 180]
+       round_pitch_deg=[-5, -10]
+    
+    3) Two passes, deterministic coverage on both, then normal sampling
+       deterministic_coverage=True
+       coverage_rounds=(0, 1)
+       cov_offsets_deg=[20, -20, 160, -160]
     """
-
     H1 = float(render.height_start_cm) / 100.0
     H2 = float(cov.height2_cm) / 100.0
     round_heights = [H1] + ([H2] if cov.two_rounds else [])
+    n_rounds = len(round_heights)
 
-    # We prefer real anchor_idxs (from compute_anchor_headings); fallback to len(anchors)
+    # Per-round yaw offsets (pad if needed)
+    round_yaw_offsets = [math.radians(float(v)) for v in (cov.round_yaw_offset_deg or [0.0])]
+    if len(round_yaw_offsets) < n_rounds:
+        round_yaw_offsets += [round_yaw_offsets[-1]] * (n_rounds - len(round_yaw_offsets))
+
+    # Per-round base pitch (deg list in cov; fallback to render.pitch_start)
+    _base_pitches_deg = list(render.round_pitch_deg or [])
+    if len(_base_pitches_deg) < n_rounds:
+        _base_pitches_deg += [_base_pitches_deg[-1] if _base_pitches_deg else float(render.pitch_start)] * (
+                    n_rounds - len(_base_pitches_deg))
+    round_pitches = [math.radians(float(x)) for x in _base_pitches_deg]
+
+    # Sanity info for underprovision warnings
     num_anchor_idxs = int(len(anchor_idxs)) if "anchor_idxs" in locals() else int(len(anchors) or 0)
-
     coverage_playlist_len = int(len(coverage_playlist)) if "coverage_playlist" in locals() else 0
-
-    n_rounds = 2 if cov.two_rounds else 1
     _warn_underprovisioned(
         cov,
         n_rounds=n_rounds,
@@ -629,73 +727,93 @@ def main():
         coverage_playlist_len=coverage_playlist_len
     )
 
-    round_yaw_offsets = [math.radians(float(v)) for v in (cov.round_yaw_offset_deg or [0.0])]
-    if len(round_yaw_offsets) < max(1, len(round_heights)):
-        round_yaw_offsets += [round_yaw_offsets[-1]] * (len(round_heights) - len(round_yaw_offsets))
-    # (If round_yaw_offsets has more entries than rounds, extras are unused.)
+    # Round budgets (soft cap per round)
+    target_per_round = max(1, int(math.ceil(cov.n_views / max(1, n_rounds))))
 
-    target_per_round = max(1, int(math.ceil(cov.n_views / max(1, len(round_heights)))))
+    # Phase plan
+    round_indices = list(range(n_rounds))
+    coverage_rounds = set(getattr(cov, "coverage_rounds", tuple()))
+    phase_plan = []
 
-    round_idx = 0
-    for round_h in round_heights:
+    if cov.deterministic_coverage and coverage_playlist_len > 0:
+        # Phase A: coverage-only rounds first, in round order
+        for r in round_indices:
+            if r in coverage_rounds:
+                phase_plan.append(("coverage", r))
+    frame_modes = []  # [{"index": i, "image": "rgb_00012.png", "mode": "deterministic"|"random", "round": r}]
+    cov_ptrs = [0] * n_rounds  # <-- one pointer per round
+
+    # Phase B: random-only rounds (all rounds, in round order)
+    for r in round_indices:
+        phase_plan.append(("random", r))
+
+
+    for phase, round_idx in phase_plan:
         if accepted >= int(cov.n_views):
             break
 
-        # -------- visit planning (per round) --------
+        round_h = round_heights[round_idx]
         base_y_offset = (round_h - float(render.height_start_cm) / 100.0)
         visit = base_traj if (cov.traj_mode == "video" and base_traj.shape[0] > 0) else None
+
         vi = 0
         rej_at_vi = 0
         prev_yaw_acc = None
         accepted_this_round = 0
 
+        # coverage-branch guard inside this phase
+        phase_is_coverage = (phase == "coverage")
+
         while accepted < int(cov.n_views) and accepted_this_round < target_per_round:
             tries += 1
             if tries > TOTAL_MAX_TRIES:
                 break
-
             # -------- viewpoint selection (coverage or normal) --------
             """
-            cov_ptr = the pointer (index) into your coverage_playlist.
-            
-            Step 0: choose a base position `p` and a seed yaw `yaw_base`.
-              • If we have a resampled path (`visit`), use visit[vi] and the scheduled heading yaw_sched[vi].
-              • Otherwise (no path), pick a random navigable point and optionally a look-at target to seed yaw.
+            We decide per attempt whether to use the deterministic coverage playlist or the
+            normal scene-aware policy.
 
-            Step 1: decide if we are in deterministic coverage mode.
-              use_coverage = (
-                  cov.deterministic_coverage            # playlist mode enabled
-                  and cov.traj_mode == "video"          # requires a path
-                  and base_traj.shape[0] > 0
-                  and cov_ptr < len(coverage_playlist)  # still have shots to consume
-                  and (round_idx in getattr(cov, "coverage_rounds", []))  # coverage applies in this round
-              )
+            Terminology
+            -----------
+            cov_ptr :
+                Index into coverage_playlist (planned shots). Advances only on accept/reject
+                of a coverage attempt. When cov_ptr == len(coverage_playlist), coverage is
+                exhausted.
 
-            ── Coverage branch (strict & repeatable) ───────────────────────────────────────
-            • Use the planned anchor index and playlist yaw:
+            Coverage (deterministic) branch
+            -------------------------------
+            • Choose the planned anchor/time index and its yaw:
                   plan = coverage_playlist[cov_ptr]
-                  p = base_traj[plan["vi"]]
-                  yaw_plan = wrap_pi(plan["yaw"] + round_yaw_offsets[round_idx])
-            • Render with fixed pitch/roll/height (no jitter). If gating fails, try small yaw nudges (±5°, ±10°) up to
-              `cov.cov_max_retries`. On accept: record, advance cov_ptr, and (optionally) advance `vi` if `cov.cov_at_same_pos=False`.
-            • NOTE: `yaw_mode` and smoothing are intentionally bypassed for determinism here.
+                  p    = base_traj[plan["vi"]]
+                  yaw  = wrap_pi(plan["yaw"] + round_yaw_offsets[round_idx])
+            • Render with fixed pitch/roll/height (no jitter). Try small yaw nudges
+              (±5°, ±10°) up to cov.cov_max_retries if the quality gate fails.
+            • On accept: record, advance cov_ptr, optionally step vi if cov.cov_at_same_pos=False.
+            • Smoothing and yaw policies (tangent/target/mixed) are bypassed here for repeatability.
 
-            ── Normal branch (scene-aware and smooth) ──────────────────────────────────────
-            • Optionally pick a look-at target `q_tar` and compute `yaw_target`.
-            • Choose heading by policy:
+            Normal (scene-aware) branch
+            ---------------------------
+            • Base pose comes from the visit path (or a random navmesh point if no path).
+            • Optionally pick a look-at target and compute yaw_target.
+            • Heading policy:
                   tangent  → yaw_final = yaw_base
                   target   → yaw_final = yaw_target
                   mixed    → yaw_final = blend_yaw(yaw_base, yaw_target, cov.yaw_mixed_alpha)
-            • Apply per-round static offset: yaw_final = wrap_pi(yaw_final + round_yaw_offsets[round_idx])
-            • Smooth between accepted frames:
-                  yaw_final = smooth_yaw(prev_yaw_acc, yaw_final,
-                                         yaw_post_limit_deg=cov.yaw_post_limit_deg,
-                                         yaw_smooth_alpha=cov.yaw_smooth_alpha)
-            • Add mild pose jitter (pitch/roll/height), render, and gate. On reject, save a thumbnail and possibly skip
-              to the next waypoint after `cov.max_rejects_per_visit` failures. On accept, update `prev_yaw_acc` and advance.
+            • Apply per-round static yaw offset, then limit and smooth yaw changes between
+              accepted frames (yaw_post_limit_deg, yaw_smooth_alpha).
+            • Use per-round base pitch (round_pitch_deg[round_idx] or render.pitch_start)
+              and add small pitch/roll/height jitter for diversity.
+            • Render → quality gate → accept or reject. On repeated rejects at a waypoint,
+              skip forward after cov.max_rejects_per_visit.
 
-            Result: `yaw_final` and `p` define the next candidate view; if it passes quality gates, we save outputs + pose.
+            Notes
+            -----
+            • Deterministic coverage is consumed before normal sampling for the rounds
+              listed in cov.coverage_rounds, preventing interleaving coverage/normal.
+            • If you maintain per-frame metadata, you can tag each accepted view as
+              "coverage" or "normal" for downstream analysis.
             """
+
             # Choose base position + seed yaw
             if visit is None:
                 p = np.asarray(sim.pathfinder.get_random_navigable_point(), dtype=np.float32).reshape(3)
@@ -709,21 +827,29 @@ def main():
                 p = visit[vi]
                 yaw_base = float(yaw_sched[vi])
 
+            # Decide branch
             use_coverage = (
-                    cov.deterministic_coverage
+                    phase_is_coverage
+                    and cov.deterministic_coverage
                     and cov.traj_mode == "video"
                     and base_traj.shape[0] > 0
-                    and cov_ptr < len(coverage_playlist)
-                    and (round_idx in getattr(cov, "coverage_rounds", []))
+                    and cov_ptrs[round_idx] < coverage_playlist_len
+                    and (round_idx in coverage_rounds)
             )
 
+            if not use_coverage and phase_is_coverage:
+                # In a coverage-only phase but playlist is exhausted for this round/overall
+                # → leave the rest of this round to the next phase (no random here).
+                break
+
             if use_coverage:
-                plan = coverage_playlist[cov_ptr]
+                plan = coverage_playlist[cov_ptrs[round_idx]]
                 p = base_traj[plan["vi"]]
                 yaw_plan = wrap_pi(plan["yaw"] + round_yaw_offsets[round_idx])
-                pitch, roll, dh = CAM_PITCH, 0.0, 0.0
 
-                # -------- render + gate (coverage) --------
+                # Fixed (no jitter) but per-round base pitch
+                pitch, roll, dh = round_pitches[round_idx], 0.0, 0.0
+
                 ok, rgb_img, depth, mask, n_cam = render_and_gate(
                     sim, agent, p, yaw_plan,
                     pitch=pitch, roll=roll, dh=dh, base_y_offset=base_y_offset,
@@ -744,19 +870,19 @@ def main():
                             break
 
                 if not ok:
-                    # -------- reject handling (coverage) --------
                     save_reject_thumbnail(OUT, accepted, rgb_img)
-                    cov_ptr += 1
+                    cov_ptrs[round_idx] += 1
                     continue
 
                 yaw_final = y_chosen
                 prev_yaw_acc = yaw_final
                 if not cov.cov_at_same_pos and visit is not None:
                     vi = (plan["vi"] + 1) % visit.shape[0]
-                cov_ptr += 1
+                cov_ptrs[round_idx] += 1
+                mode_tag = "deterministic"
 
             else:
-                # Normal, possibly target/mixed + smoothing
+                # random branch (unchanged except base pitch uses round_pitches[round_idx])
                 yaw_target = None
                 if cov.yaw_mode in ("target", "mixed"):
                     q_tar = sample_target(sim, p, min_geo=float(cov.min_geo), max_geo=float(cov.max_geo), tries=30)
@@ -777,11 +903,10 @@ def main():
                     yaw_smooth_alpha=float(cov.yaw_smooth_alpha)
                 )
 
-                pitch = CAM_PITCH + rng.normal(0.0, PITCH_JITTER_STD)
+                pitch = round_pitches[round_idx] + rng.normal(0.0, PITCH_JITTER_STD)
                 roll = rng.normal(0.0, ROLL_JITTER_STD)
                 dh = rng.normal(0.0, HEIGHT_JITTER_STD_M)
 
-                # -------- render + gate (normal) --------
                 ok, rgb_img, depth, mask, n_cam = render_and_gate(
                     sim, agent, p, yaw_final,
                     pitch=pitch, roll=roll, dh=dh, base_y_offset=base_y_offset,
@@ -789,7 +914,6 @@ def main():
                 )
 
                 if not ok:
-                    # -------- reject handling (normal) --------
                     save_reject_thumbnail(OUT, accepted, rgb_img)
                     rej_at_vi += 1
                     if visit is not None and rej_at_vi >= int(cov.max_rejects_per_visit):
@@ -801,18 +925,19 @@ def main():
                 vi += 1
                 rej_at_vi = 0
                 prev_yaw_acc = yaw_final
+                mode_tag = "random"
 
             # -------- pose meta (after ACCEPT) --------
             s = agent.get_state().sensor_states["rgba"]
             T_c2w = T_c2w_from_sensor_state(s)
 
-            # -------- products (XYZ etc.) --------
+            # Products (XYZ etc.)
             n_cam_nn = np.nan_to_num(n_cam, nan=0.0)
             pts_cam = unproject_depth_to_points_cam(depth, K)
             pts_w = (pts_cam @ T_c2w[:3, :3].T) + T_c2w[:3, 3]
             pts_w_img = pts_w.reshape(H, W, 3).astype(np.float32)
 
-            # -------- saving part --------
+            # Saving + push mode tag
             i = accepted
             save_outputs(
                 OUT, i,
@@ -822,8 +947,10 @@ def main():
                 rgb_flat=rgb_img.reshape(-1, 3)
             )
 
-            # -------- record metadata --------
+            # Record metadata + capture mode tag
             poses_meta.append(pose_meta_from_state(s, T_c2w, idx=i, round_idx=round_idx, round_h=round_h))
+            frame_modes.append({"index": i, "image": f"rgb_{i:05d}.png", "mode": mode_tag, "round": round_idx})
+
             if accepted > 1:
                 last = np.asarray(poses_meta[-2]["position_world"])
                 cur = np.asarray(poses_meta[-1]["position_world"])
@@ -832,8 +959,14 @@ def main():
             accepted += 1
             accepted_this_round += 1
 
-        # -------- post round --------
-        round_idx += 1
+    # -------- persist pose list --------
+    with open(OUT / "poses_c2w.json", "w") as f:
+        json.dump(poses_meta, f, indent=2)
+
+    # Also persist capture-mode breakdown (deterministic vs random)
+    with open(OUT / "capture_modes.json", "w") as f:
+        json.dump(frame_modes, f, indent=2)
+
     # Hereafter extraction is finished!!
 
     # -------- persist pose list --------
@@ -914,9 +1047,11 @@ def main():
         image_plane="near",  # <-- textured near plane
         image_dir=OUT / "images",
         image_name_fmt="rgb_{:05d}.png",
-        image_facing="in", # "out"|"in"|"both" -> I don't know why "both" fails - just fix "in"
-        texture_every=max(1, every),  # texture at same thinning as frusta
-        max_textured=120,  # cap for file size safety
+        image_facing="both", # "out"|"in"|"both" -> I don't know why "both" fails - just fix "in"
+        # texture_every=max(1, every),  # texture at same thinning as frusta
+        # max_textured=120,  # cap for file size safety
+        texture_every=1,
+        max_textured=None,
         point_subsample=1,
         visit=base_traj if base_traj.shape[0] else None,
         path_every=1,

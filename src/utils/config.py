@@ -36,6 +36,8 @@ class RenderCfg:
     # Camera pose: pitch/roll in degrees, height in cm
     pitch_start: float = -5.0
     pitch_jitter: float = 5.0
+    # empty = use render.pitch_start for all rounds
+    round_pitch_deg: List[float] = field(default_factory=list)
     height_start_cm: float = 150.0
     height_jitter_cm: float = 10.0
     roll_jitter: float = 3.0
@@ -44,7 +46,6 @@ class RenderCfg:
     dataset_type: str = "replicaCAD_baked"    # {"replicaCAD_baked","replica","hm3d_v2"}
     dataset_path: str = "habitat-data/replica_cad_baked_lighting"
     scene_id: str = "sc0_00"
-
 
 @dataclass
 class CoverageCfg:
@@ -111,7 +112,7 @@ class CoverageCfg:
     yaw_mode: str = "mixed"                   # {"tangent","target","mixed"}
     yaw_mixed_alpha: float = 0.35
     yaw_limit_deg: float = 25.0
-    round_yaw_offset_deg: List[float] = field(default_factory=lambda: [0.0, 25.0])
+    round_yaw_offset_deg: List[float] = field(default_factory=lambda: [0.0]) # [0.0], [0.0 90.0]
     yaw_post_limit_deg: float = 12.0
     yaw_smooth_alpha: float = 0.35
 
@@ -198,15 +199,7 @@ def _parser_with_defaults(render: RenderCfg, cov: CoverageCfg, qual: QualityCfg)
 
     # profile (visible in --help)
     p.add_argument("--profile", type=str, default=Profile.NONE,
-                   choices=[
-                       Profile.NONE,
-                       Profile.STANDARD,
-                       Profile.FAST_DEBUG,
-                       Profile.ROOM_SMALL,
-                       Profile.APT_MEDIUM,
-                       Profile.BUILDING_LARGE,
-                       Profile.WAREHOUSE_XL
-                   ],
+                   choices=[Profile.NONE] + list(PROFILES.keys()),
                    help="Preset that overrides defaults; explicit flags still win.")
 
     # RenderCfg
@@ -216,6 +209,7 @@ def _parser_with_defaults(render: RenderCfg, cov: CoverageCfg, qual: QualityCfg)
     p.add_argument("--SSAA", type=int, default=render.SSAA)
     p.add_argument("--hfov-deg", type=float, default=render.hfov_deg)
     p.add_argument("--pitch-start", type=float, default=render.pitch_start)
+    p.add_argument("--round-pitch-deg", type=float, nargs="*", default=render.round_pitch_deg)
     p.add_argument("--pitch-jitter", type=float, default=render.pitch_jitter)
     p.add_argument("--height-start-cm", type=float, default=render.height_start_cm)
     p.add_argument("--height-jitter-cm", type=float, default=render.height_jitter_cm)
@@ -308,7 +302,9 @@ def parse_configs_from_cli() -> Tuple[RenderCfg, CoverageCfg, QualityCfg]:
     render = replace(render,
         seed=args.seed, out_path=args.out_path,
         H=args.H, W=args.W, SSAA=args.SSAA, hfov_deg=args.hfov_deg,
-        pitch_start=args.pitch_start, pitch_jitter=args.pitch_jitter,
+        pitch_start=args.pitch_start,
+        round_pitch_deg=args.round_pitch_deg or render.round_pitch_deg,
+        pitch_jitter=args.pitch_jitter,
         height_start_cm=args.height_start_cm, height_jitter_cm=args.height_jitter_cm,
         roll_jitter=args.roll_jitter,
         dataset_type=args.dataset_type, dataset_path=args.dataset_path, scene_id=args.scene_id)

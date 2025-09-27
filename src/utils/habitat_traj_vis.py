@@ -317,20 +317,6 @@ def _near_plane_textured_quad(
     *,
     facing: str = "both",  # "out" | "in" | "both"
 ) -> trimesh.Trimesh:
-    """
-    Textured quad on the frustum's near plane.
-
-    Args:
-        corners: (8,3) frustum corners in world (n_tl,n_tr,n_br,n_bl,f_tl,f_tr,f_br,f_bl)
-        image_path: path to the RGB file
-        facing: "out" -> face outward, "in" -> face inward, "both" -> double-sided
-
-    Returns:
-        trimesh.Trimesh with texture visuals; if "both", reversed faces are appended.
-    """
-    from PIL import Image
-    from trimesh.visual import texture as ttex
-
     # near corners in TL,TR,BR,BL order
     V = np.stack([corners[0], corners[1], corners[2], corners[3]], axis=0)  # (4,3)
 
@@ -340,34 +326,24 @@ def _near_plane_textured_quad(
                    [1.0, 0.0],
                    [0.0, 0.0]], dtype=np.float32)
 
-    # Faces: choose winding to control normal direction
-    F_out = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)  # points "out"
-    F_in  = np.array([[2, 1, 0], [3, 2, 0]], dtype=np.int64)  # points "in"
+    # Base (front/outward) triangles
+    F_out = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
 
-    if facing == "in":
-        F = F_in
-        uv_all = uv
-    elif facing == "both":
-        F = np.vstack([F_out, F_in])
-        uv_all = np.vstack([uv, uv])
-    else:
+    # Choose winding(s) — duplicate faces for "both"
+    if facing == "out":
         F = F_out
-        uv_all = uv
+    elif facing == "in":
+        F = F_out[:, ::-1]                 # same verts, reversed winding (normals flip)
+    else:  # "both"
+        F = np.vstack([F_out, F_out[:, ::-1]])  # two windings, robust to culling
 
     img = Image.open(str(image_path)).convert("RGB")
 
     mesh = trimesh.Trimesh(vertices=V, faces=F, process=False)
-    material = ttex.SimpleMaterial(image=img)
+    # No need for doubleSided; same verts share UVs for both windings
+    mesh.visual = ttex.TextureVisuals(uv=uv, image=img)
 
-    # Best-effort: ask exporter to mark the material as double-sided
-    try:
-        material.doubleSided = (facing == "both")
-    except Exception:
-        pass
-
-    mesh.visual = ttex.TextureVisuals(uv=uv_all, image=img, material=material)
     return mesh
-
 
 
 def write_glb_pointcloud_with_frusta(
@@ -484,20 +460,30 @@ def write_glb_pointcloud_with_frusta(
     if image_plane == "near" and image_dir is not None:
         tex_step = max(1, int(texture_every))
         added = 0
+        miss_frame = 0
+        miss_file = 0
+        capped = 0
+
         for m in poses_meta[::tex_step]:
             if max_textured is not None and added >= int(max_textured):
+                capped += 1
                 break
             frame = int(m.get("frame", -1))
             if frame < 0:
+                miss_frame += 1
                 continue
             img_path = Path(image_dir) / image_name_fmt.format(frame)
             if not img_path.exists():
+                miss_file += 1
                 continue
+
             T = np.asarray(m["T_c2w"], np.float32)
             corners = _frustum_corners_world(T, intr, near, far)
             quad = _near_plane_textured_quad(corners, img_path, facing=image_facing)
             scene.add_geometry(quad, node_name=f"frustum_near_tex_{frame}")
             added += 1
+
+        print(f"[glb] textured={added}, miss_frame={miss_frame}, miss_file={miss_file}, capped={capped}")
 
     # 4) Path as thin cylinders
     if visit is not None and np.asarray(visit).size >= 6 and path_radius > 0:
