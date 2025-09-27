@@ -1,0 +1,82 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Raw dataset
+habitat-data/
+
+# Exported results
+export-*/
+export_*/*
+export-replica/
+export-replica-cad/
+export-replica-cad-baked/
+export-hm3d-v1/
+export-hm3d-v2/
+export-hm3d-v2-minival/
+
+# Heavy byproducts (just in case)
+*.exr
+*.ply
+*.glb
+*.mp4
+*.avi
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtualenvs / env files
+.venv/
+.venv*/
+.env
+.env.*
+.conda/
+.conda_env/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Editors / OS
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+
+# --- Pixi ---
+# Keep pixi.toml under version control; ignore local envs
+.pixi/
+pixi.lock
+
+# --- Data / exports / artifacts (generated) ---
+habitat-data/
+data/
+export_scene/
+export-*/
+export_*/
+*/export_scene/
+*/export-*/
+outputs/
+outputs-*/
+artifacts/
+logs/
+
+# Common heavy outputs (keep these ignored unless you explicitly want to track small samples)
+*.exr
+*.ply
+*.glb
+*.mp4
+*.avi
+
+# Cachey app folders (optional)
+.trimesh_cache/
