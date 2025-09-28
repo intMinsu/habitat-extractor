@@ -7,11 +7,8 @@ export CUDA_VISIBLE_DEVICES=0
 PY=python
 MOD="src.main"
 
-NAS_PATH="."
-PROJECT_PATH="."
-
-REPLICA_PATH="${NAS_PATH}/habitat-data/replica"
-REPLICA_OUT_ROOT="${PROJECT_PATH}/export-replica"
+NAS_PATH="/mnt/rcvnas1/datasets/ufm-moge"
+PROJECT_PATH="/home/minsu/GGInversion"
 
 HM3D_PATH="${NAS_PATH}/habitat-data/hm3d_v2_minival"
 HM3D_OUT_ROOT="${PROJECT_PATH}/export-hm3d-v2-minival"
@@ -25,7 +22,7 @@ EXTRA_ARGS=${EXTRA_ARGS:-}
 # Skip scenes that already finished (has poses_c2w.json)
 SKIP_IF_DONE=${SKIP_IF_DONE:-1}
 
-mkdir -p "logs" "$REPLICA_OUT_ROOT" "$HM3D_OUT_ROOT"
+mkdir -p "logs" "$HM3D_OUT_ROOT"
 
 log() { echo -e "[$(date '+%H:%M:%S')] $*"; }
 
@@ -33,7 +30,6 @@ run_cmd() {
   local profile=$1 dataset_type=$2 dataset_path=$3 scene_id=$4 out_path=$5
   local tag="${dataset_type}_${profile}_${scene_id}"
   local logf="logs/${tag}.log"
-
   if [[ "$SKIP_IF_DONE" == "1" && -f "${out_path}/poses_c2w.json" ]]; then
     log "SKIP (done): $tag -> ${out_path}"
     return 0
@@ -54,30 +50,6 @@ run_cmd() {
   set +x
   log "DONE : $tag"
 }
-
-# ------------------------------------------------------------------------------
-# (1) small_room_dense_2round on Replica: hotel_0, office_0..4, room_0..2
-# ------------------------------------------------------------------------------
-REPLICA_SMALL_SCENES=(
-  hotel_0
-  office_0 office_1 office_2 office_3 office_4
-  room_0 room_1 room_2
-)
-
-for sid in "${REPLICA_SMALL_SCENES[@]}"; do
-  run_cmd "${PROFILE_SMALL}" "replica" "${REPLICA_PATH}" "${sid}" "${REPLICA_OUT_ROOT}/${sid}"
-done
-
-# ------------------------------------------------------------------------------
-# (2a) multi_rooms_dense_2round on Replica: apartment_0..2, frl_apartment_0 (only one frl)
-# ------------------------------------------------------------------------------
-REPLICA_LARGE_SCENES=(
-  apartment_0 apartment_1 apartment_2
-  frl_apartment_0
-)
-for sid in "${REPLICA_LARGE_SCENES[@]}"; do
-  run_cmd "${PROFILE_MULTI}" "replica" "${REPLICA_PATH}" "${sid}" "${REPLICA_OUT_ROOT}/${sid}"
-done
 
 # ------------------------------------------------------------------------------
 # (2b) multi_rooms_dense_2round on HM3D v2 minival: ALL scenes under the folder

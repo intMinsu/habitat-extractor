@@ -7,8 +7,8 @@ export CUDA_VISIBLE_DEVICES=0
 PY=python
 MOD="src.main"
 
-NAS_PATH="."
-PROJECT_PATH="."
+NAS_PATH="/mnt/rcvnas1/datasets/ufm-moge"
+PROJECT_PATH="/home/minsu/GGInversion"
 
 REPLICA_PATH="${NAS_PATH}/habitat-data/replica"
 REPLICA_OUT_ROOT="${PROJECT_PATH}/export-replica"
@@ -69,10 +69,10 @@ for sid in "${REPLICA_SMALL_SCENES[@]}"; do
 done
 
 # ------------------------------------------------------------------------------
-# (2a) multi_rooms_dense_2round on Replica: apartment_0..2, frl_apartment_0 (only one frl)
+# (2a) multi_rooms_dense_2round on Replica: apartment_0
 # ------------------------------------------------------------------------------
 REPLICA_LARGE_SCENES=(
-  apartment_0 apartment_1 apartment_2
+  apartment_0 apartment_1 apartment_1
   frl_apartment_0
 )
 for sid in "${REPLICA_LARGE_SCENES[@]}"; do
@@ -84,7 +84,7 @@ done
 # Scene IDs look like '00800-TEEsavR23oF'; out dir uses the numeric prefix (e.g., export-hm3d-v2-minival/00800)
 # ------------------------------------------------------------------------------
 shopt -s nullglob
-for d in "${HM3D_PATH}"/hm3d-minival-habitat-v2/*/; do
+for d in "${HM3D_PATH}"/*/; do
   sid="$(basename "$d")"                 # e.g., 00800-TEEsavR23oF
   short_id="${sid%%-*}"                  # e.g., 00800
   out_dir="${HM3D_OUT_ROOT}/${short_id}" # e.g., export-hm3d-v2-minival/00800
