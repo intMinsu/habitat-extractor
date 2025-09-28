@@ -1,12 +1,13 @@
 # Habitat Scene Extractor
 
 <div align="center">
-  <img src="assets/rgb_00005.jpg" alt="RGB image example" width="32%">
+  <img src="assets/rgb_00005.png" alt="RGB image example" width="32%">
   <img src="assets/depth_vis_00005.png" alt="Depth image example" width="32%">
   <img src="assets/normal_00005.png" alt="Normal image example" width="32%">
 </div>
 <div align="center">
-  <img src="assets/glb_apartment_01.png" alt="GLB image example" width="32%">
+  <img src="assets/glb_apartment_01.png" alt="GLB image example 1" width="32%">
+  <img src="assets/glb_apartment_02.png" alt="GLB image example 2" width="32%">
   <img src="assets/pointmap_example.png" alt="Pointmap image example" width="32%">
 </div>
 
