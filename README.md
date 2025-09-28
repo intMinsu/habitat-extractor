@@ -1,5 +1,15 @@
 # Habitat Scene Extractor
 
+<div align="center">
+  <img src="assets/rgb_00005.jpg" alt="RGB image example" width="32%">
+  <img src="assets/depth_vis_00005.png" alt="Depth image example" width="32%">
+  <img src="assets/normal_00005.png" alt="Normal image example" width="32%">
+</div>
+<div align="center">
+  <img src="assets/glb_apartment_01.png" alt="GLB image example" width="32%">
+  <img src="assets/pointmap_example.png" alt="Pointmap image example" width="32%">
+</div>
+
 Export SfM-friendly views from Habitat scenes (Replica, HM3D v2, ReplicaCAD baked).  
 The pipeline builds a smooth “video-like” trajectory, auto-tunes and spreads anchors, plans per-frame headings, gates low-quality views, writes COLMAP, and ships nice visualizations (PLY/GLB, bird’s-eye).
 
